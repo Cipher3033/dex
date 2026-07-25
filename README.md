@@ -85,30 +85,48 @@ Separating **Shared** and **Owned** objects is the key architectural decision th
 
 Dark Pool trades hide trade size and intent by submitting a ZK proof instead of raw inputs. The proof is generated off-chain and verified on-chain by the `ZkVerifier` contract.
 
-### Circuit
+### Circuit — `DarkPoolSwap`
 
-The reference circuit ([`circ.circom`](./circ.circom)) is a minimal Groth16 circuit over the BN254 curve. In production this would encode the trade constraints (e.g. "the committed input amount satisfies the pool invariant without revealing the value").
+[`circ.circom`](./circ.circom) implements a production-grade **Groth16 circuit over BN254**, instantiated as `DarkPoolSwap(20, 64)`.
 
-```circom
-pragma circom 2.0.0;
+In a single proof it simultaneously proves **6 constraints**:
 
-template Multiplier2() {
-    signal input a;
-    signal input b;
-    signal output c;
+| # | Constraint | What it proves |
+|---|---|---|
+| 1 | **AMM Invariant** | The swap satisfies `(reserve_x · fee_den + Δx · fee_num) · (reserve_y − Δy) ≥ reserve_x · reserve_y · fee_den` — the constant-product formula with fee, without revealing any amount |
+| 2 | **Slippage Guard** | `Δy ≥ min_output` — trader's minimum is met, preventing sandwich attacks |
+| 3 | **Range Checks** | All amounts `Δx, Δy, reserve_x, reserve_y` fit in 64 bits — prevents overflow and negative-number exploits |
+| 4 | **Input Commitment** | `Poseidon(secret, salt) == input_commitment` — trader owns the input without revealing it |
+| 5 | **Nullifier** | `Poseidon(secret) == nullifier_hash` — posted on-chain to prevent double-spending the same commitment |
+| 6 | **Merkle Inclusion** | `Poseidon(reserve_x, reserve_y)` is a leaf in the pool state Merkle tree (depth 20, ~1M leaves) — proves the reserves used are genuine |
 
-    c <== a * b;
-}
+#### Signal interface
 
-component main = Multiplier2();
+```
+Public  → pool_state_root, input_commitment, nullifier_hash, min_output, fee_num, fee_den
+Private → reserve_x, reserve_y, delta_x, delta_y, trader_secret, trader_salt,
+          merkle_path[20], merkle_indices[20]
+Output  → out_nullifier
 ```
 
-Inputs are defined in [`input.json`](./input.json):
+#### Sample inputs ([`input.json`](./input.json))
 
 ```json
 {
-    "a": "3",
-    "b": "11"
+    "pool_state_root":  "12345678901234567890",
+    "input_commitment": "9876543210987654321",
+    "nullifier_hash":   "1122334455667788990",
+    "min_output":       "9",
+    "fee_num":          "997",
+    "fee_den":          "1000",
+    "reserve_x":        "1000000",
+    "reserve_y":        "1000000",
+    "delta_x":          "1000",
+    "delta_y":          "996",
+    "trader_secret":    "42",
+    "trader_salt":      "99",
+    "merkle_path":      ["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],
+    "merkle_indices":   ["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"]
 }
 ```
 
