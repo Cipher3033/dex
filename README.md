@@ -1,6 +1,6 @@
 # Sui Dark Pool — ZK-Protected DEX Architecture
 
-A research & reference implementation demonstrating how to build a **MEV-resistant, privacy-preserving decentralized exchange** on the [Sui blockchain](https://sui.io), combining Sui's object model, Programmable Transaction Blocks (PTBs), and ZK-SNARK proofs.
+A research & reference implementation demonstrating how to build a **MEV-resistant, privacy-preserving decentralized exchange** on the [Sui blockchain](https://sui.io), combining Sui's object model, Programmable Transaction Blocks (PTBs), and zero-knowledge proofs built with [Noir](https://noir-lang.org/).
 
 ---
 
@@ -10,8 +10,8 @@ A research & reference implementation demonstrating how to build a **MEV-resista
   - [1. Client & SDK Orchestration Layer](#1-client--sdk-orchestration-layer)
   - [2. Sui Network Execution Layer](#2-sui-network-execution-layer)
   - [3. Move Smart Contracts (On-Chain)](#3-move-smart-contracts-on-chain)
-- [ZK-SNARK Pipeline](#zk-snark-pipeline)
-  - [Circuit](#circuit)
+- [Noir ZK Pipeline](#noir-zk-pipeline)
+  - [Circuit Structure](#circuit-structure)
   - [Running the Pipeline](#running-the-pipeline)
 - [Repository Structure](#repository-structure)
 
@@ -40,7 +40,7 @@ flowchart TD
     subgraph L3 ["3 — MOVE SMART CONTRACTS (ON-CHAIN)"]
         F["LiquidityPool\n(Shared Object)\nUpdates pool balances securely"]
         G["User Position\n(Owned Object)\nMints LP tokens or returns output coins"]
-        H["Native ZK Verifier\nValidates Groth16 proof\nfor Dark Pool trades"]
+        H["Native ZK Verifier\nValidates proof\nfor Dark Pool trades"]
     end
 
     L1 -- "Submits Atomic Bundle" --> L2
@@ -75,91 +75,99 @@ Sui's validator network processes the PTB with **all-or-nothing atomicity**. Bec
 |---|---|---|
 | `LiquidityPool` | Shared Object | Holds pool reserves; updated by every swap |
 | `UserPosition` | Owned Object | Mints LP tokens or returns output coins to the trader |
-| `ZkVerifier` | Shared Object | Verifies a Groth16 / BN254 proof before allowing a Dark Pool trade |
+| `ZkVerifier` | Shared Object | Verifies ZK proof before allowing a Dark Pool trade |
 
 Separating **Shared** and **Owned** objects is the key architectural decision that enables parallel execution. Owned object transactions never contend with each other and are processed without consensus overhead.
 
 ---
 
-## ZK-SNARK Pipeline
+## Noir ZK Pipeline
 
-Dark Pool trades hide trade size and intent by submitting a ZK proof instead of raw inputs. The proof is generated off-chain and verified on-chain by the `ZkVerifier` contract.
+Dark Pool trades hide trade size and intent by submitting a zero-knowledge proof generated off-chain. The circuit is written in [Noir](https://noir-lang.org/) (`.nr`), a Rust-like DSL for ZK circuits.
 
-### Circuit — `DarkPoolSwap`
+### Circuit Structure — `src/main.nr`
 
-[`circ.circom`](./circ.circom) implements a production-grade **Groth16 circuit over BN254**, instantiated as `DarkPoolSwap(20, 64)`.
-
-In a single proof it simultaneously proves **6 constraints**:
+The Noir circuit [`src/main.nr`](./src/main.nr) simultaneously proves **6 core constraints**:
 
 | # | Constraint | What it proves |
 |---|---|---|
-| 1 | **AMM Invariant** | The swap satisfies `(reserve_x · fee_den + Δx · fee_num) · (reserve_y − Δy) ≥ reserve_x · reserve_y · fee_den` — the constant-product formula with fee, without revealing any amount |
-| 2 | **Slippage Guard** | `Δy ≥ min_output` — trader's minimum is met, preventing sandwich attacks |
-| 3 | **Range Checks** | All amounts `Δx, Δy, reserve_x, reserve_y` fit in 64 bits — prevents overflow and negative-number exploits |
-| 4 | **Input Commitment** | `Poseidon(secret, salt) == input_commitment` — trader owns the input without revealing it |
-| 5 | **Nullifier** | `Poseidon(secret) == nullifier_hash` — posted on-chain to prevent double-spending the same commitment |
-| 6 | **Merkle Inclusion** | `Poseidon(reserve_x, reserve_y)` is a leaf in the pool state Merkle tree (depth 20, ~1M leaves) — proves the reserves used are genuine |
+| 1 | **AMM Invariant** | `(reserve_x · fee_den + Δx · fee_num) · (reserve_y − Δy) ≥ reserve_x · reserve_y · fee_den` — constant-product formula with fee |
+| 2 | **Slippage Guard** | `Δy ≥ min_output` — enforces trader's minimum received amount |
+| 3 | **Pool Drainage** | `reserve_y > Δy` — prevents pool depletion |
+| 4 | **Commitment Verification** | `Poseidon(secret, salt) == input_commitment` — proves trader ownership |
+| 5 | **Nullifier Derivation** | `Poseidon(secret) == nullifier_hash` — prevents double-spending |
+| 6 | **Merkle Inclusion Proof** | `MerkleRoot(Poseidon(reserve_x, reserve_y)) == pool_state_root` — proves pool reserves are genuine (depth 20) |
 
-#### Signal interface
+#### Noir Code ([`src/main.nr`](./src/main.nr))
 
-```
-Public  → pool_state_root, input_commitment, nullifier_hash, min_output, fee_num, fee_den
-Private → reserve_x, reserve_y, delta_x, delta_y, trader_secret, trader_salt,
-          merkle_path[20], merkle_indices[20]
-Output  → out_nullifier
-```
+```rust
+use dep::std;
 
-#### Sample inputs ([`input.json`](./input.json))
+fn main(
+    // Public inputs
+    pool_state_root: pub Field,
+    input_commitment: pub Field,
+    nullifier_hash: pub Field,
+    min_output: pub Field,
+    fee_num: pub Field,
+    fee_den: pub Field,
 
-```json
-{
-    "pool_state_root":  "12345678901234567890",
-    "input_commitment": "9876543210987654321",
-    "nullifier_hash":   "1122334455667788990",
-    "min_output":       "9",
-    "fee_num":          "997",
-    "fee_den":          "1000",
-    "reserve_x":        "1000000",
-    "reserve_y":        "1000000",
-    "delta_x":          "1000",
-    "delta_y":          "996",
-    "trader_secret":    "42",
-    "trader_salt":      "99",
-    "merkle_path":      ["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],
-    "merkle_indices":   ["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"]
+    // Private inputs
+    reserve_x: Field,
+    reserve_y: Field,
+    delta_x: Field,
+    delta_y: Field,
+    trader_secret: Field,
+    trader_salt: Field,
+    merkle_path: [Field; 20],
+    merkle_indices: [u1; 20]
+) {
+    let lhs_a = reserve_x * fee_den + delta_x * fee_num;
+    let net_y = reserve_y - delta_y;
+    let lhs = lhs_a * net_y;
+    let rhs = reserve_x * reserve_y * fee_den;
+    assert(lhs >= rhs, "AMM invariant violation");
+
+    assert(delta_y >= min_output, "Slippage tolerance exceeded");
+    assert(reserve_y > delta_y, "Insufficient liquidity in pool");
+
+    let computed_commitment = std::hash::poseidon::bn254::hash_2([trader_secret, trader_salt]);
+    assert(input_commitment == computed_commitment, "Invalid commitment proof");
+
+    let computed_nullifier = std::hash::poseidon::bn254::hash_1([trader_secret]);
+    assert(nullifier_hash == computed_nullifier, "Invalid nullifier proof");
+
+    let leaf = std::hash::poseidon::bn254::hash_2([reserve_x, reserve_y]);
+    let computed_root = std::merkle::compute_merkle_root(leaf, merkle_indices, merkle_path);
+    assert(pool_state_root == computed_root, "Pool state Merkle proof verification failed");
 }
 ```
 
-### Running the Pipeline
+---
 
-The full ZK-SNARK pipeline (compile → witness → trusted setup → prove → verify) is automated. Choose the script that matches your environment.
+### Running the Pipeline
 
 **Linux / macOS**
 
 ```bash
-chmod +x run_zk.sh
-./run_zk.sh
+chmod +x run_noir.sh
+./run_noir.sh
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-.\run_zk.ps1
+.\run_noir.ps1
 ```
 
-#### What the script does
+#### Nargo & Barretenberg Commands
 
-| Step | Tool | Output |
+| Step | Tool | Command |
 |---|---|---|
-| 1. Compile circuit | `circom` | `circ.r1cs`, `circ.wasm` |
-| 2. Generate witness | `snarkjs` / Node | `witness.wtns` |
-| 3. Powers of Tau (Phase 1) | `snarkjs powersoftau` | `pot12_final.ptau` |
-| 4. Circuit setup (Phase 2) | `snarkjs groth16 setup` | `circ_final.zkey` |
-| 5. Export verification key | `snarkjs zkey export` | `verification_key.json` |
-| 6. Generate proof | `snarkjs groth16 prove` | `proof.json`, `public.json` |
-| 7. Verify proof | `snarkjs groth16 verify` | ✓ / ✗ |
-
-**Prerequisites:** Node.js, `circom` CLI, `snarkjs` (install globally with `npm i -g snarkjs`).
+| 1. Check circuit | `nargo` | `nargo check` |
+| 2. Execute witness | `nargo` | `nargo execute witness` |
+| 3. Generate proof | `bb` | `bb prove -b ./target/dark_pool.json -w ./target/witness.gz -o ./target/proof` |
+| 4. Verify proof | `bb` | `bb verify -p ./target/proof -k ./target/vk` |
 
 ---
 
@@ -167,9 +175,11 @@ chmod +x run_zk.sh
 
 ```
 .
-├── circ.circom          # ZK circuit (Circom 2.0, Groth16 / BN254)
-├── input.json           # Public inputs for the circuit
-├── run_zk.sh            # ZK pipeline automation script (Linux/macOS)
-├── run_zk.ps1           # ZK pipeline automation script (Windows)
-└── README.md            # This document
+├── Nargo.toml           # Noir package manifest
+├── Prover.toml          # Input parameters for proving/execution
+├── src/
+│   └── main.nr          # Noir ZK circuit
+├── run_noir.sh          # Pipeline script (Linux/macOS)
+├── run_noir.ps1         # Pipeline script (Windows)
+└── README.md            # Documentation
 ```
